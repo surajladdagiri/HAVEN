@@ -6,12 +6,19 @@
 //
 
 import SwiftUI
+import ARKit
 
 @main
 struct HAVENApp: App {
+    let isLiDARSupported = ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh)
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            //ContentView()
+            if isLiDARSupported {
+                LiDARView()
+            } else {
+                AIView()
+            }
         }
     }
 }
