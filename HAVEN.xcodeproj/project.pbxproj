@@ -29,9 +29,22 @@
 		440685852F51688D00877BF5 /* HAVENUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = HAVENUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		44A395312FA4DDAC0084EA67 /* Exceptions for "HAVEN" folder in "HAVEN" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = 4406856D2F51688B00877BF5 /* HAVEN */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		440685702F51688B00877BF5 /* HAVEN */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				44A395312FA4DDAC0084EA67 /* Exceptions for "HAVEN" folder in "HAVEN" target */,
+			);
 			path = HAVEN;
 			sourceTree = "<group>";
 		};
@@ -400,7 +413,9 @@
 				DEVELOPMENT_TEAM = D7Q7DB5R8J;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = HAVEN/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = HAVENDev;
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Needed to communicated to Arduino";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera Access Required";
@@ -437,7 +452,9 @@
 				DEVELOPMENT_TEAM = D7Q7DB5R8J;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = HAVEN/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = HAVENDev;
+				INFOPLIST_KEY_ITSAppUsesNonExemptEncryption = NO;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Needed to communicated to Arduino";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera Access Required";
