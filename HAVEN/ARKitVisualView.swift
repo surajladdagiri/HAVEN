@@ -1035,6 +1035,7 @@ struct HapticIndicatorView: View {
 struct ARKitVisualView: View {
     @ObservedObject var streamManager: LiDARStreamManager
     @ObservedObject var bleManager: BLEManager
+    @Environment(\.scenePhase) private var scenePhase
 
     @State private var showCameraFeed = true
     @State private var show2DMap = false
@@ -1103,6 +1104,11 @@ struct ARKitVisualView: View {
             }
             .padding(.bottom, 44)
             .zIndex(2)
+        }
+        .onChange(of: scenePhase) {
+            if scenePhase == .background {
+                self.bleManager.sendHapticValues([0, 0, 0, 0, 0])
+            }
         }
         .onAppear {
             streamManager.bleManager = bleManager
