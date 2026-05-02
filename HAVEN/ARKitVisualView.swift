@@ -278,6 +278,9 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
     @Published var plannedPath: [GridPoint] = []
     @Published var goalPoint: GridPoint? = nil
     @Published var hapticValues: [Int] = [0, 0, 0, 0, 0]
+    /// Set to true while CommandView is on-screen so pathing/pattern haptics
+    /// are silenced — CommandView drives the motors directly via its own presets.
+    @Published var isCommandViewActive: Bool = false
 
     let gridSize: Float = NavigationEngine.gridSize
 
@@ -599,6 +602,10 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
 
     // ── Haptic Output Tick (main thread, 10 Hz) ───────────────────────────────
     private func tickHapticOutput(desiredYaw: Float?, currentYaw: Float, now: TimeInterval) {
+        // While CommandView is active, suppress all pathing/pattern output.
+        // CommandView sends its own preset values directly via bleManager.sendHapticValues.
+        guard !isCommandViewActive else { return }
+
         if specialPattern != .idle {
             let vals = advanceSpecialPattern(now: now)
             hapticValues = vals.map { Int($0) }
@@ -613,7 +620,7 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
             return [0, 0, 0, 0, 0]
         }()
         hapticValues = haptics
-        bleManager.sendHapticValues(haptics.map { UInt8(min(100, max(0, $0))) })
+        bleManager.sendHapticValues(haptics.map { UInt8(min(25, max(0, $0))) })
     }
 
     // ── Special Pattern Engine ────────────────────────────────────────────────
@@ -1035,10 +1042,10 @@ struct HapticIndicatorView: View {
 struct ARKitVisualView: View {
     @ObservedObject var streamManager: LiDARStreamManager
     @ObservedObject var bleManager: BLEManager
-    @Environment(\.scenePhase) private var scenePhase
 
     @State private var showCameraFeed = true
     @State private var show2DMap = false
+    @Environment(\.scenePhase) private var scenePhase
 
     // FIX (Step 5): streamManager is now injected from HAVENApp (where it lives as
     // @StateObject) instead of being created here. Previously, creating it inside init()

@@ -44,6 +44,8 @@ struct HAVENApp: App {
                             ToolbarItem(placement: .navigationBarTrailing) {
                                 NavigationLink(
                                     destination: CommandView(appState: appState, ble: blemanager)
+                                        .onAppear   { streamManager.isCommandViewActive = true  }
+                                        .onDisappear { streamManager.isCommandViewActive = false }
                                 ) {
                                     Image(systemName: "desktopcomputer.and.arrow.down")
                                         .foregroundColor(.white)

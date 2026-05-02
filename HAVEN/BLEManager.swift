@@ -184,7 +184,7 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
 
         let payload: [UInt8] = Array(
             (values + [0,0,0,0,0]).prefix(5)
-        ).map { min($0, 100) }
+        ).map { min($0, 25) }
 
         print("📤 Sending:", payload)
 
