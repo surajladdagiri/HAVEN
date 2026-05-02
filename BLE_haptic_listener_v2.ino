@@ -7,6 +7,10 @@
 #define NUM_HAPTICS 5
 const unsigned long UPDATE_INTERVAL = 25;
 
+// Maximum intensity sent to any haptic tactor (0–127 RTP scale).
+// Keeping this at or below 50 prevents overdrive on the DRV2605L ERM motors.
+const uint8_t MAX_HAPTIC_INTENSITY = 50;
+
 const char* SERVICE_UUID        = "54df84fc-7f55-4867-bb29-617f9d2a7925";
 const char* CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
 const int PORTS[NUM_HAPTICS] = {7, 6, 5, 4, 3};
@@ -19,8 +23,6 @@ BLECharacteristic hapticChar(CHARACTERISTIC_UUID, BLERead | BLEWrite, NUM_HAPTIC
 int signals[NUM_HAPTICS] = {0};
 unsigned long lastUpdate = 0;
 bool portOK[NUM_HAPTICS] = {false};
-
-const uint8_t AMP = 100; // DEBUG: force strong vibration
 
 // ─────────────────────────────────────────────
 
@@ -46,7 +48,7 @@ void setup() {
 
         if (drv.begin(&Wire1)) {
             drv.selectLibrary(1);
-            drv.useERM(); // 🔥 IMPORTANT FIX
+            drv.useERM();
             drv.setMode(DRV2605_MODE_REALTIME);
 
             portOK[i] = true;
@@ -55,14 +57,6 @@ void setup() {
             Serial.print("Port "); Serial.print(i); Serial.println(" FAIL");
         }
     }
-
-    // startup test
-    Serial.println("Startup vibration test...");
-    for (int i = 0; i < NUM_HAPTICS; i++) signals[i] = 100;
-    updateHaptics();
-    delay(500);
-    for (int i = 0; i < NUM_HAPTICS; i++) signals[i] = 0;
-    updateHaptics();
 
     // BLE
     if (!BLE.begin()) {
@@ -127,8 +121,9 @@ void updateHaptics() {
         drv.useERM();
         drv.setMode(DRV2605_MODE_REALTIME);
 
-        int val = constrain(signals[i], 0, 100);
-        uint8_t out = (val > 0) ? AMP : 0;
+        // Clamp incoming signal to [0, MAX_HAPTIC_INTENSITY].
+        // This ensures motors never exceed 50 regardless of what iOS sends.
+        uint8_t out = (uint8_t)constrain(signals[i], 0, MAX_HAPTIC_INTENSITY);
 
         drv.setRealtimeValue(out);
 

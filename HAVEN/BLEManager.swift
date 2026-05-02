@@ -190,10 +190,19 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
 
         let data = Data(payload)
 
-        // 🔥 DEBUG: FORCE WRITE WITH RESPONSE
-        peripheral.writeValue(data,
-                              for: char,
-                              type: .withResponse)
+        // Auto-detect write type from the characteristic's advertised properties.
+        // Using the wrong type causes a silent failure — CoreBluetooth will drop the
+        // write without an error if the peripheral doesn't support the requested mode.
+        //   • .write             → .withResponse  (Arduino confirms receipt)
+        //   • .writeWithoutResponse → .withoutResponse  (fire-and-forget, lower latency)
+        // Prefer write-with-response when the characteristic supports it so that the
+        // Arduino's hapticChar.written() handler fires correctly; fall back to
+        // without-response otherwise (e.g. a different firmware build).
+        let writeType: CBCharacteristicWriteType = char.properties.contains(.write)
+            ? .withResponse
+            : .withoutResponse
+
+        peripheral.writeValue(data, for: char, type: writeType)
     }
 
     // ── Delegate: write confirmation (withResponse only) ─────────────────────
