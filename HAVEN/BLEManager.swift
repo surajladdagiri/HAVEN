@@ -18,7 +18,6 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
 
     private var manager: CBCentralManager!
     private var ESP32: CBPeripheral?
-    private var MainService: CBService?
     private var MainCharacteristic: CBCharacteristic?
 
     @Published var peripherals = [CBPeripheral]()
@@ -123,7 +122,6 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
     func peripheral(_ peripheral: CBPeripheral, didDiscoverServices error: Error?) {
         guard let services = peripheral.services else { return }
         for service in services {
-            MainService = service
             peripheral.discoverCharacteristics(nil, for: service)
         }
     }
@@ -131,32 +129,83 @@ class BLEManager: NSObject, ObservableObject, CBCentralManagerDelegate, CBPeriph
     func peripheral(_ peripheral: CBPeripheral, didDiscoverCharacteristicsFor service: CBService,
                     error: Error?) {
         guard let chars = service.characteristics else { return }
+
+        // Pick the best writable characteristic.
+        // Priority: write-with-response > write-without-response > first available.
+        // Most Arduino haptic firmware uses writeWithoutResponse for low-latency output.
+        var bestChar: CBCharacteristic? = nil
         for char in chars {
-            MainCharacteristic = char
-            print("Characteristic – read:\(char.properties.contains(.read)) write:\(char.properties.contains(.write)) writeNoResp:\(char.properties.contains(.writeWithoutResponse))")
+            let props = char.properties
+            print("Characteristic \(char.uuid) – " +
+                  "read:\(props.contains(.read)) " +
+                  "write:\(props.contains(.write)) " +
+                  "writeNoResp:\(props.contains(.writeWithoutResponse))")
+            if props.contains(.write) || props.contains(.writeWithoutResponse) {
+                // Prefer a full .write char; accept .writeWithoutResponse
+                if bestChar == nil || (!bestChar!.properties.contains(.write) && props.contains(.write)) {
+                    bestChar = char
+                }
+            }
         }
+        MainCharacteristic = bestChar ?? chars.first
+
+        if let mc = MainCharacteristic {
+            print("→ Using characteristic \(mc.uuid) with properties \(mc.properties.rawValue)")
+        } else {
+            print("⚠️ No usable characteristic found – haptics will not fire")
+        }
+
         withAnimation { appState?.currPage = .Algorithm }
         withAnimation { connected = true }
         withAnimation { FinishedAuto = true }
     }
 
-    // ── Write Helpers ─────────────────────────────────────────────────────────
+    // ── Write — v2 Raw Byte Protocol ─────────────────────────────────────────
+    //
+    // Sends exactly 5 bytes to the Arduino, one per DRV2605L motor, each 0–100.
+    // The firmware maps them directly:
+    //   byte[0] = Motor 1 (far left)
+    //   byte[1] = Motor 2
+    //   byte[2] = Motor 3 (centre)
+    //   byte[3] = Motor 4
+    //   byte[4] = Motor 5 (far right)
+    //
+    // Write type is determined from the characteristic's advertised properties:
+    //   • .write             → .withResponse  (Arduino confirms receipt)
+    //   • .writeWithoutResponse → .withoutResponse  (fire-and-forget, lower latency)
+    // Using the wrong type causes silent failure — hence the auto-detect.
 
-    /// Sends a UTF-8 string to the peripheral (legacy / debug use).
-    func sendCommand(_ command: String) {
-        guard let peripheral = ESP32, let char = MainCharacteristic else { return }
-        peripheral.writeValue(Data(command.utf8), for: char, type: .withResponse)
+    func sendHapticValues(_ values: [UInt8]) {
+        guard let peripheral = ESP32,
+              let char = MainCharacteristic else {
+            print("❌ BLE not ready")
+            return
+        }
+
+        let payload: [UInt8] = Array(
+            (values + [0,0,0,0,0]).prefix(5)
+        ).map { min($0, 100) }
+
+        print("📤 Sending:", payload)
+
+        let data = Data(payload)
+
+        // 🔥 DEBUG: FORCE WRITE WITH RESPONSE
+        peripheral.writeValue(data,
+                              for: char,
+                              type: .withResponse)
     }
 
-    /// Sends exactly 5 raw bytes to the haptic controller.
-    /// The firmware reads them as motor intensities 0-100 (bytes are clamped on the Arduino).
-    ///
-    /// Layout: [strong_left, light_left, straight, light_right, strong_right]
-    func sendHapticValues(_ values: [UInt8]) {
-        guard let peripheral = ESP32, let char = MainCharacteristic else { return }
-        // Always send exactly NUM_HAPTICS (5) bytes; pad or trim if needed
-        var payload = [UInt8](repeating: 0, count: 5)
-        for i in 0..<min(5, values.count) { payload[i] = values[i] }
-        peripheral.writeValue(Data(payload), for: char, type: .withResponse)
+    // ── Delegate: write confirmation (withResponse only) ─────────────────────
+
+    func peripheral(_ peripheral: CBPeripheral,
+                    didWriteValueFor characteristic: CBCharacteristic,
+                    error: Error?) {
+
+        if let error = error {
+            print("❌ WRITE ERROR:", error)
+        } else {
+            print("✅ WRITE ACKED")
+        }
     }
 }

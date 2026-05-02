@@ -19,10 +19,28 @@ import Network
 // MARK: - Grid Coordinate
 // ─────────────────────────────────────────────────────────────────────────────
 
-struct GridPoint: Hashable {
+// Sendable: safe to share across actor/queue boundaries (meshQueue, navQueue ↔ main).
+//
+// Hashable conformance is implemented explicitly with `nonisolated` witnesses.
+// In Swift 6, synthesized conformances in a file that has any implicit @MainActor
+// inference get tagged @MainActor too — making them unusable as Dictionary keys or
+// Set members inside nonisolated closures (the "cannot be used in nonisolated context"
+// error). Explicit nonisolated implementations opt the conformance out of that isolation.
+struct GridPoint: Sendable {
     let x: Int
     let z: Int
+
+    nonisolated static func == (lhs: GridPoint, rhs: GridPoint) -> Bool {
+        lhs.x == rhs.x && lhs.z == rhs.z
+    }
+
+    nonisolated func hash(into hasher: inout Hasher) {
+        hasher.combine(x)
+        hasher.combine(z)
+    }
 }
+
+extension GridPoint: Hashable {}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Navigation Engine  (pure, stateless)
@@ -87,12 +105,6 @@ enum NavigationEngine {
     }
 
     // ── Straight-Line Path (always preferred over A*) ────────────────────────
-    //
-    // Walks a Bresenham line and checks a 3-cell-wide corridor.
-    // Centre cells must be passable. Side cells that are *unknown* (not yet
-    // scanned) are allowed — only confirmed obstacles on the sides fail the check.
-    // This prevents A* from finding winding routes when the direct path is open,
-    // and eliminates the left/right oscillation caused by A* re-planning.
 
     static func straightLinePath(
         from start: GridPoint,
@@ -115,10 +127,8 @@ enum NavigationEngine {
             let pz = Int(round(Float(start.z) + t * Float(dz)))
             let center = GridPoint(x: px, z: pz)
 
-            // Centre cell must be passable
             if !isPassable(center, in: grid) { return nil }
 
-            // Side cells: only fail on *known* obstacles; unknown = ok
             let left  = GridPoint(x: px + perpX, z: pz + perpZ)
             let right = GridPoint(x: px - perpX, z: pz - perpZ)
             if let lc = grid[left],  lc != 2, lc != 7 { return nil }
@@ -191,27 +201,6 @@ enum NavigationEngine {
     }
 
     // ── Proportional Haptic Mapping ──────────────────────────────────────────
-    //
-    // 5 tactors span ±90° of navigable FOV (evenly spaced at 45° intervals):
-    //
-    //   idx:  [0]    [1]    [2]    [3]    [4]
-    //        -90°   -45°    0°   +45°   +90°
-    //        ◀◀      ◀      ▲      ▶     ▶▶
-    //
-    // The required turn angle maps to a float position [0..4].
-    // Total intensity ≤ 100 is split linearly between the two bracketing tactors.
-    //
-    //   Examples:
-    //     22.5° right →  pos=2.5 → m[2]=50, m[3]=50
-    //     45°   right →  pos=3.0 → m[3]=100
-    //     90°   right →  pos=4.0 → m[4]=100
-    //     90°   left  →  pos=0.0 → m[0]=100
-    //
-    // ARKit sign: diff = desired − current
-    //   diff > 0  →  turn LEFT  →  pos < 2
-    //   diff < 0  →  turn RIGHT →  pos > 2
-    //
-    // Deadzone (< 7°): soft centre pulse (25) confirms on-track.
 
     static func hapticValues(desiredYaw: Float, currentYaw: Float) -> [Int] {
         var diff = desiredYaw - currentYaw
@@ -221,7 +210,6 @@ enum NavigationEngine {
         let deadzone: Float = 0.12   // ≈ 7°
         if abs(diff) < deadzone { return [0, 0, 25, 0, 0] }
 
-        // Map diff ∈ [-π/2, +π/2] → position ∈ [0, 4]
         let fovHalf: Float = .pi / 2
         let pos = max(0.0, min(4.0, (-diff / fovHalf + 1.0) * 2.0))
 
@@ -240,8 +228,6 @@ enum NavigationEngine {
     }
 
     // ── Door-Ahead Detection ──────────────────────────────────────────────────
-    // Scans 0.5–3 m ahead in a ±15° arc. Returns true if any door cell (class 7)
-    // is found in that cone.
 
     static func isDoorAhead(
         startGrid: GridPoint,
@@ -299,32 +285,37 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
     let arView = ARView(frame: .zero)
     private var goalAnchor: AnchorEntity? = nil
     // Last known camera world position — used to sanity-check mesh vertices
+    // Accessed from the meshQueue (not main), so protected by meshQueue serialisation.
     private var lastCameraX: Float = 0.0
     private var lastCameraY: Float = 0.0
     private var lastCameraZ: Float = 0.0
     /// Mesh vertices further than this from the camera are discarded as tracking glitches.
     private let maxVertexDistance: Float = 20.0
 
-    // ── BLE (injected; ObservedObject to match this project's pattern) ────────
-    @ObservedObject var bleManager: BLEManager
+    // ── BLE reference (plain var — @ObservedObject is only valid in SwiftUI Views) ──
+    var bleManager: BLEManager
 
     // ── TCP streaming ─────────────────────────────────────────────────────────
     var listener: NWListener?
     var activeConnection: NWConnection?
     let networkQueue = DispatchQueue(label: "com.haven.network")
 
+    // ── Mesh processing queue ─────────────────────────────────────────────────
+    // Heavy vertex iteration runs here so the ARKit/main thread is freed promptly.
+    // This is the root fix for "retaining N ARFrames": if didUpdate(anchors:) blocks
+    // the thread ARKit calls delegates on, ARKit queues up frames until it can deliver
+    // them — hence the accumulation warning. By returning from the delegate method
+    // immediately and doing work on meshQueue, we release that thread right away.
+    private let meshQueue = DispatchQueue(label: "com.haven.mesh", qos: .userInitiated)
+
     // ── Navigation state ──────────────────────────────────────────────────────
     private var lockedGoal: GridPoint? = nil
-    private let goalRefreshRadiusCells: Float = 25.0    // ~1.25 m proximity
+    private let goalRefreshRadiusCells: Float = 25.0
     private let minGoalRefreshInterval: TimeInterval = 8.0
     private var lastGoalRefreshTime: TimeInterval = -100
     private var storedDesiredYaw: Float? = nil
 
     // ── Special haptic patterns ───────────────────────────────────────────────
-    //
-    //  Door alert    : all 5 tactors at 60 → gap → repeat      (4 phases × 0.15 s)
-    //  No-path alert : outermost pair [50,0,0,0,50] → gap × 3  (6 phases × 0.15 s)
-    //
     private enum SpecialPattern { case idle, door, noPath }
     private var specialPattern: SpecialPattern = .idle
     private var specialPhase: Int = 0
@@ -335,7 +326,6 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
 
     private var lastNoPathAlertTime: TimeInterval = -100
     private let noPathAlertCooldown: TimeInterval = 4.0
-    /// Timestamp of the first consecutive "no path" result — alert fires only after 2 s.
     private var noPathSince: TimeInterval? = nil
     private let noPathDebounce: TimeInterval = 2.0
 
@@ -348,17 +338,31 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
 
     // ── Timing ────────────────────────────────────────────────────────────────
     private var lastAstarTime: TimeInterval = 0
-    private let astarInterval: TimeInterval = 0.25      // 4 Hz path refresh (was 2 Hz)
+    private let astarInterval: TimeInterval = 0.25      // 4 Hz path refresh
 
     private var lastHapticTime: TimeInterval = 0
     private let hapticInterval: TimeInterval = 0.10     // 10 Hz haptic output
 
+    // FIX (Step 6): occupancyGrid is @Published, so every assignment triggers a SwiftUI
+    // objectWillChange notification → full OccupancyMapView Canvas re-render (up to 12 000
+    // cells). ARKit can deliver mesh anchor updates at ~60 Hz. Rendering 12 000 cells 60×/s
+    // saturates the main thread and is the primary cause of the "retaining N ARFrames"
+    // warning. Throttling the @Published write to 10 Hz (same rate as haptics) keeps the
+    // nav snapshot frequency unchanged while cutting Canvas redraws by ~6×.
+    // The internal pendingGridUpdates dict accumulates changes between publishes so no
+    // observation data is lost — it just arrives in batches instead of frame-by-frame.
+    private var lastGridPublishTime: TimeInterval = 0
+    private let gridPublishInterval: TimeInterval = 0.10  // 10 Hz visual refresh
+    private var pendingGridUpdates: [GridPoint: Int] = [:]
+
     private let navQueue = DispatchQueue(label: "com.haven.nav", qos: .userInitiated)
 
+    // ── Nav guard — prevents stacking multiple simultaneous nav runs ──────────
+    // Written/read only on navQueue.
+    private var navRunning = false
+
     // ── Camera blindspot floor-seed radius ────────────────────────────────────
-    // iPhone LiDAR has a ~0.5 m near-field blindspot. Seed a disc of floor cells
-    // under the user so A* always has a valid start cell on system warm-up.
-    private let blindspotCells: Int = 10   // 10 × 5 cm = 0.5 m radius
+    private let blindspotCells: Int = 10
 
     // ── Init ──────────────────────────────────────────────────────────────────
     init(ble: BLEManager) {
@@ -381,91 +385,125 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     // ── ARSession: Mesh Anchors ───────────────────────────────────────────────
+    //
+    // FIX: Previously this method processed thousands of mesh vertices
+    // synchronously on the ARKit delegate thread (main), which caused ARKit to
+    // queue up incoming frames while waiting — producing the "retaining N ARFrames"
+    // warning. Now we snapshot all state we need from the calling thread and
+    // immediately dispatch the heavy work to meshQueue so the caller returns fast.
+
     func session(_ session: ARSession, didUpdate anchors: [ARAnchor]) {
         let meshAnchors = anchors.compactMap { $0 as? ARMeshAnchor }
         guard !meshAnchors.isEmpty else { return }
 
-        var localUpdates: [GridPoint: Int] = [:]
-        var allStreamData = Data()
+        // Snapshot the camera position from the calling-thread's last-known values.
+        // These are plain Floats written on the same thread (ARKit/main) so no lock needed.
+        let camX = lastCameraX
+        let camZ = lastCameraZ
+        let maxVD = maxVertexDistance
+        let gSize = gridSize
+        let conn  = activeConnection   // NWConnection is thread-safe
 
-        for anchor in meshAnchors {
-            guard let uuidData = anchor.identifier.uuidString.data(using: .utf8),
-                  uuidData.count == 36 else { continue }
+        // Return immediately — all heavy work happens on meshQueue.
+        meshQueue.async { [weak self] in
+            guard let self else { return }
 
-            var streamData = Data()
-            streamData.append(uuidData)
-            var anchorFloats: [Float32] = []
+            var localUpdates: [GridPoint: Int] = [:]
+            var allStreamData = Data()
 
-            let geo      = anchor.geometry
-            let vertBuf  = geo.vertices.buffer.contents()
-            let faceBuf  = geo.faces.buffer.contents()
-            let classBuf = geo.classification?.buffer.contents()
+            for anchor in meshAnchors {
+                guard let uuidData = anchor.identifier.uuidString.data(using: .utf8),
+                      uuidData.count == 36 else { continue }
 
-            for faceIdx in 0..<geo.faces.count {
-                var classID: Float32 = 0
-                if let cb = classBuf, let cd = geo.classification {
-                    let off = cd.offset + faceIdx * cd.stride
-                    classID = Float32(cb.advanced(by: off)
-                        .assumingMemoryBound(to: UInt8.self).pointee)
+                var streamData = Data()
+                streamData.append(uuidData)
+                var anchorFloats: [Float32] = []
+
+                let geo      = anchor.geometry
+                let vertBuf  = geo.vertices.buffer.contents()
+                let faceBuf  = geo.faces.buffer.contents()
+                let classBuf = geo.classification?.buffer.contents()
+
+                for faceIdx in 0..<geo.faces.count {
+                    var classID: Float32 = 0
+                    if let cb = classBuf, let cd = geo.classification {
+                        let off = cd.offset + faceIdx * cd.stride
+                        classID = Float32(cb.advanced(by: off)
+                            .assumingMemoryBound(to: UInt8.self).pointee)
+                    }
+                    let faceBase = faceIdx * geo.faces.indexCountPerPrimitive * geo.faces.bytesPerIndex
+                    for j in 0..<geo.faces.indexCountPerPrimitive {
+                        let idxOff  = faceBase + j * geo.faces.bytesPerIndex
+                        let vertIdx = geo.faces.bytesPerIndex == 4
+                            ? Int(faceBuf.advanced(by: idxOff).assumingMemoryBound(to: UInt32.self).pointee)
+                            : Int(faceBuf.advanced(by: idxOff).assumingMemoryBound(to: UInt16.self).pointee)
+                        let vOff = geo.vertices.offset + vertIdx * geo.vertices.stride
+                        let v    = vertBuf.advanced(by: vOff)
+                            .assumingMemoryBound(to: SIMD3<Float>.self).pointee
+                        let w    = simd_mul(anchor.transform, simd_float4(v.x, v.y, v.z, 1.0))
+
+                        let vdx = w.x - camX, vdz = w.z - camZ
+                        if vdx*vdx + vdz*vdz > maxVD * maxVD { continue }
+
+                        anchorFloats += [w.x, w.y, w.z, classID]
+
+                        let cls = Int(classID)
+                        if cls != 3 {
+                            localUpdates[GridPoint(x: Int(round(w.x / gSize)),
+                                                   z: Int(round(w.z / gSize)))] = cls
+                        }
+                    }
                 }
-                let faceBase = faceIdx * geo.faces.indexCountPerPrimitive * geo.faces.bytesPerIndex
-                for j in 0..<geo.faces.indexCountPerPrimitive {
-                    let idxOff  = faceBase + j * geo.faces.bytesPerIndex
-                    let vertIdx = geo.faces.bytesPerIndex == 4
-                        ? Int(faceBuf.advanced(by: idxOff).assumingMemoryBound(to: UInt32.self).pointee)
-                        : Int(faceBuf.advanced(by: idxOff).assumingMemoryBound(to: UInt16.self).pointee)
-                    let vOff = geo.vertices.offset + vertIdx * geo.vertices.stride
-                    let v    = vertBuf.advanced(by: vOff)
-                        .assumingMemoryBound(to: SIMD3<Float>.self).pointee
-                    let w    = simd_mul(anchor.transform, simd_float4(v.x, v.y, v.z, 1.0))
 
-                    // ── Sanity check: skip vertices that are suspiciously far from the
-                    // camera. ARKit occasionally produces garbage transforms during
-                    // tracking recovery that would plant phantom cells far away on the map.
-                    let vdx = w.x - lastCameraX, vdz = w.z - lastCameraZ
-                    if vdx*vdx + vdz*vdz > maxVertexDistance * maxVertexDistance { continue }
+                var count = Int32(anchorFloats.count).littleEndian
+                streamData.append(Data(bytes: &count, count: 4))
+                anchorFloats.withUnsafeBufferPointer { buf in
+                    streamData.append(buf.baseAddress!.withMemoryRebound(
+                        to: UInt8.self, capacity: buf.count * 4) {
+                            Data(buffer: UnsafeBufferPointer(start: $0, count: buf.count * 4))
+                        })
+                }
+                allStreamData.append(streamData)
+            }
 
-                    anchorFloats += [w.x, w.y, w.z, classID]
+            // Merge grid updates on main thread (occupancyGrid is @Published on main).
+            // FIX (Step 6): previously this block wrote self.occupancyGrid on every mesh
+            // delivery (~60 Hz), triggering a full SwiftUI Canvas re-render each time.
+            // Now we merge into pendingGridUpdates (no @Published notification) and only
+            // assign to occupancyGrid at most every 100 ms, cutting redraws to 10 Hz.
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                let now = CACurrentMediaTime()
 
-                    let cls = Int(classID)
-                    if cls != 3 {
-                        localUpdates[GridPoint(x: Int(round(w.x / gridSize)),
-                                               z: Int(round(w.z / gridSize)))] = cls
+                // Accumulate updates (no @Published fire yet).
+                for (pt, cls) in localUpdates {
+                    let ex = self.pendingGridUpdates[pt] ?? self.occupancyGrid[pt] ?? -1
+                    if      cls == 7                               { self.pendingGridUpdates[pt] = 7 }
+                    else if [0,1,4,5,6].contains(cls) && ex != 7  { self.pendingGridUpdates[pt] = 1 }
+                    else if cls == 2 && ![1,7].contains(ex)        { self.pendingGridUpdates[pt] = 2 }
+                    self.gridTimestamps[pt] = now
+                }
+
+                // Publish at 10 Hz: copy-modify-assign once per batch window.
+                if now - self.lastGridPublishTime >= self.gridPublishInterval {
+                    self.lastGridPublishTime = now
+                    if !self.pendingGridUpdates.isEmpty {
+                        var g = self.occupancyGrid
+                        for (pt, cls) in self.pendingGridUpdates { g[pt] = cls }
+                        self.pendingGridUpdates.removeAll(keepingCapacity: true)
+                        self.occupancyGrid = g   // ← single @Published notification per batch
+                    }
+                    if now - self.lastEvictionTime >= self.evictionInterval {
+                        self.lastEvictionTime = now
+                        self.evictOldCells(now: now)
                     }
                 }
             }
 
-            var count = Int32(anchorFloats.count).littleEndian
-            streamData.append(Data(bytes: &count, count: 4))
-            anchorFloats.withUnsafeBufferPointer { buf in
-                streamData.append(buf.baseAddress!.withMemoryRebound(
-                    to: UInt8.self, capacity: buf.count * 4) {
-                        Data(buffer: UnsafeBufferPointer(start: $0, count: buf.count * 4))
-                    })
+            // TCP send happens on meshQueue — NWConnection is thread-safe
+            if let conn, conn.state == .ready, !allStreamData.isEmpty {
+                conn.send(content: allStreamData, completion: .contentProcessed { _ in })
             }
-            allStreamData.append(streamData)
-        }
-
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            let now = CACurrentMediaTime()
-            var g   = self.occupancyGrid
-            for (pt, cls) in localUpdates {
-                let ex = g[pt] ?? -1
-                if      cls == 7                               { g[pt] = 7 }
-                else if [0,1,4,5,6].contains(cls) && ex != 7  { g[pt] = 1 }
-                else if cls == 2 && ![1,7].contains(ex)        { g[pt] = 2 }
-                self.gridTimestamps[pt] = now
-            }
-            self.occupancyGrid = g
-            if now - self.lastEvictionTime >= self.evictionInterval {
-                self.lastEvictionTime = now
-                self.evictOldCells(now: now)
-            }
-        }
-
-        if let conn = activeConnection, conn.state == .ready, !allStreamData.isEmpty {
-            conn.send(content: allStreamData, completion: .contentProcessed { _ in })
         }
     }
 
@@ -478,6 +516,7 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
         let yaw = frame.camera.eulerAngles.y
         let now = CACurrentMediaTime()
 
+        // Update camera position snapshot (read by meshQueue for vertex sanity-check)
         lastCameraX = wx
         lastCameraY = wy
         lastCameraZ = wz
@@ -487,47 +526,61 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
             self.currentPosition = CGPoint(x: CGFloat(wx), y: CGFloat(wz))
             self.currentYaw = yaw
 
-            // Seed floor cells in the LiDAR blindspot so A* has a valid start immediately
             let sg = GridPoint(x: Int(round(wx / self.gridSize)),
                                z: Int(round(wz / self.gridSize)))
             self.seedFloorIfNeeded(around: sg)
         }
 
-        // Job 1: A* path refresh at 2 Hz
+        // Job 1: A* path refresh at 4 Hz
+        // FIX: Previously used a double-dispatch (main → navQueue) which piled up async
+        // work on main every frame. Now we take the grid snapshot on main in a single
+        // hop, then fire navQueue inside that same block — same two queues, but the
+        // outer closure is only queued at the rate-limited interval (4 Hz), not 60 Hz.
         if now - lastAstarTime >= astarInterval {
             lastAstarTime = now
             let posSnap = CGPoint(x: CGFloat(wx), y: CGFloat(wz))
             let yawSnap = yaw
             let camY    = wy
+
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 let gridSnap   = self.occupancyGrid
                 let lockedSnap = self.lockedGoal
-                self.navQueue.async {
+
+                // Guard: skip if a nav run is already in flight.
+                // navRunning is only written from navQueue, so we set it here
+                // under navQueue.async to keep access serialised.
+                self.navQueue.async { [weak self] in
+                    guard let self else { return }
+                    guard !self.navRunning else { return }
+                    self.navRunning = true
                     self.runNavigation(grid: gridSnap, worldPos: posSnap,
                                        yaw: yawSnap, cameraY: camY,
                                        lockedGoal: lockedSnap, now: now)
+                    self.navRunning = false
                 }
             }
         }
 
-        // Job 2: Haptic BLE output at 10 Hz
-        // Must be on main because CBCentralManager was created on the main queue.
+        // Job 2: Haptic BLE output at 10 Hz.
+        // FIX (Step 4): peripheral.writeValue(_:for:type:) is thread-safe in CoreBluetooth
+        // and can be called from any thread. The previous DispatchQueue.main.async hop
+        // deferred haptic output by one run-loop cycle every tick, adding ~16 ms of
+        // unnecessary latency and one more item to the already-congested main queue.
+        // storedDesiredYaw is now main-thread-only (Step 3), so we read it inside a
+        // main.async — but we avoid the double-dispatch by calling tickHapticOutput
+        // inside the same block that already runs on main for the nav snapshot.
+        // Since session(_:didUpdate:frame:) is called on main by ARKit, we can call
+        // tickHapticOutput directly here with no dispatch at all.
         if now - lastHapticTime >= hapticInterval {
             lastHapticTime = now
-            let desired = storedDesiredYaw
-            DispatchQueue.main.async { [weak self] in
-                self?.tickHapticOutput(desiredYaw: desired, currentYaw: yaw, now: now)
-            }
+            tickHapticOutput(desiredYaw: storedDesiredYaw, currentYaw: yaw, now: now)
         }
 
         streamPose(x: wx, y: wy, z: wz)
     }
 
     // ── Floor Blindspot Seeding ───────────────────────────────────────────────
-    // Seeds unknown cells within `blindspotCells` radius as floor (class 2),
-    // only when the user's own cell is still nil (not yet scanned by LiDAR).
-    // Called on main thread.
     private func seedFloorIfNeeded(around center: GridPoint) {
         guard occupancyGrid[center] == nil else { return }
         let r   = blindspotCells
@@ -546,13 +599,10 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
 
     // ── Haptic Output Tick (main thread, 10 Hz) ───────────────────────────────
     private func tickHapticOutput(desiredYaw: Float?, currentYaw: Float, now: TimeInterval) {
-        // Special patterns (door / no-path) override navigation haptics
         if specialPattern != .idle {
             let vals = advanceSpecialPattern(now: now)
             hapticValues = vals.map { Int($0) }
-            //bleManager.sendHapticValues(vals)
-            let command = vals.map { String($0) }.joined(separator: ",")
-            bleManager.sendCommand(command)
+            bleManager.sendHapticValues(vals)
             return
         }
 
@@ -563,9 +613,7 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
             return [0, 0, 0, 0, 0]
         }()
         hapticValues = haptics
-       // bleManager.sendHapticValues(haptics.map { UInt8(min(100, max(0, $0))) })
-        let command = haptics.map { String(min(100, max(0, $0))) }.joined(separator: ",")
-        bleManager.sendCommand(command)
+        bleManager.sendHapticValues(haptics.map { UInt8(min(100, max(0, $0))) })
     }
 
     // ── Special Pattern Engine ────────────────────────────────────────────────
@@ -578,8 +626,8 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
 
         let maxPhase: Int
         switch specialPattern {
-        case .door:   maxPhase = 4   // phases 0-3: buzz/gap/buzz/gap
-        case .noPath: maxPhase = 6   // phases 0-5: (buzz/gap) × 3
+        case .door:   maxPhase = 4
+        case .noPath: maxPhase = 6
         case .idle:   maxPhase = 0
         }
 
@@ -609,10 +657,9 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     private func triggerNoPathAlert(now: TimeInterval) {
-        // Start the debounce clock on first consecutive no-path result
         if noPathSince == nil { noPathSince = now }
         guard let since = noPathSince,
-              now - since >= noPathDebounce,              // must be no-path for 2+ s
+              now - since >= noPathDebounce,
               now - lastNoPathAlertTime >= noPathAlertCooldown,
               specialPattern == .idle else { return }
         lastNoPathAlertTime  = now
@@ -621,7 +668,6 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
         specialPhaseDeadline = now + 0.15
     }
 
-    /// Call this whenever a valid path IS found to reset the debounce clock.
     private func clearNoPathDebounce() {
         noPathSince = nil
     }
@@ -640,7 +686,6 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
             z: Int(round(Float(worldPos.y) / gridSize))
         )
 
-        // Door detection — fires alert on main thread if door found ahead
         if NavigationEngine.isDoorAhead(startGrid: startGrid, facingYaw: yaw, grid: grid) {
             DispatchQueue.main.async { self.triggerDoorAlert(now: CACurrentMediaTime()) }
         }
@@ -653,9 +698,13 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
         } else {
             guard let newGoal = NavigationEngine.findGoal(
                 grid: grid, from: startGrid, facingYaw: yaw) else {
-                storedDesiredYaw = nil
+                // FIX (Step 3): storedDesiredYaw was written directly on navQueue here,
+                // racing with the main-thread read in session(_:didUpdate:frame:).
+                // Move the nil write into the existing main-thread dispatch so the
+                // property is only ever mutated on main.
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
+                    self.storedDesiredYaw = nil
                     self.lockedGoal  = nil
                     self.goalPoint   = nil
                     self.plannedPath = []
@@ -665,8 +714,6 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
                 return
             }
 
-            // Suppress goal flicker: if new goal is within 25° of the current
-            // goal's direction AND we refreshed recently, keep the old goal.
             if let locked = lockedGoal,
                now - lastGoalRefreshTime < minGoalRefreshInterval {
                 let oldAng = atan2(Float(locked.x  - startGrid.x), Float(locked.z  - startGrid.z))
@@ -674,7 +721,7 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
                 var diff   = newAng - oldAng
                 while diff >  .pi { diff -= 2 * .pi }
                 while diff < -.pi { diff += 2 * .pi }
-                goal = abs(diff) < 0.44 ? locked : newGoal   // ≈25° tolerance
+                goal = abs(diff) < 0.44 ? locked : newGoal
             } else {
                 goal = newGoal
             }
@@ -687,18 +734,18 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
             }
         }
 
-        // ── Pathfinding: straight line first, A* as fallback ─────────────────
+        // ── Pathfinding ───────────────────────────────────────────────────────
         let rawPath: [GridPoint]
 
         if let line = NavigationEngine.straightLinePath(from: startGrid, to: goal, in: grid) {
-            rawPath = line   // direct path is clear — always prefer this
+            rawPath = line
         } else if let star = NavigationEngine.astar(grid: grid, from: startGrid, to: goal) {
             rawPath = star
         } else {
-            // Goal is unreachable — force refresh next cycle and alert user
-            storedDesiredYaw = nil
+            // FIX (Step 3): storedDesiredYaw was written on navQueue — moved to main dispatch.
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
+                self.storedDesiredYaw = nil
                 self.lockedGoal  = nil
                 self.plannedPath = []
                 self.goalPoint   = goal
@@ -708,12 +755,15 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
             return
         }
 
-        storedDesiredYaw = NavigationEngine.desiredYaw(path: rawPath, from: startGrid)
+        // FIX (Step 3): compute desiredYaw on navQueue (pure math, no shared state) then
+        // dispatch the result to main so storedDesiredYaw is only ever written on main.
+        let computedYaw = NavigationEngine.desiredYaw(path: rawPath, from: startGrid)
 
         let displayPath = NavigationEngine.smoothedPath(rawPath, step: 4)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.clearNoPathDebounce()   // valid path found — reset debounce clock
+            self.storedDesiredYaw = computedYaw   // ← main-thread write; race eliminated
+            self.clearNoPathDebounce()
             self.plannedPath = displayPath
             self.goalPoint   = goal
             self.update3DGoalMarker(to: goal, cameraY: cameraY)
@@ -721,8 +771,6 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     // ── 3D Goal Marker (main thread) ──────────────────────────────────────────
-    // Removes the previous anchor and places a new yellow sphere at the goal's
-    // world-space (X, Z) position.  Floor height estimated as cameraY − 1.2 m.
     private func update3DGoalMarker(to goal: GridPoint?, cameraY: Float) {
         goalAnchor?.removeFromParent()
         goalAnchor = nil
@@ -739,7 +787,7 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
                 isMetallic: false
             )]
         )
-        sphere.position = SIMD3<Float>(0, 0.20, 0)   // float slightly above floor
+        sphere.position = SIMD3<Float>(0, 0.20, 0)
 
         let anchor = AnchorEntity(world: SIMD3<Float>(wx, wy, wz))
         anchor.addChild(sphere)
@@ -786,7 +834,7 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
         data.append("POSE--------------------------------".data(using: .utf8)!)
         var cnt = Int32(3).littleEndian
         data.append(Data(bytes: &cnt, count: 4))
-        var arr: [Float32] = [x, y, z]
+        let arr: [Float32] = [x, y, z]
         arr.withUnsafeBufferPointer { buf in
             data.append(buf.baseAddress!.withMemoryRebound(to: UInt8.self, capacity: 12) {
                 Data(buffer: UnsafeBufferPointer(start: $0, count: 12))
@@ -797,15 +845,17 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
     func pause() {
+        // storedDesiredYaw is now main-thread-only (Step 3); pause() is called
+        // from onDisappear which runs on main, so this direct write is safe.
         storedDesiredYaw = nil
         specialPattern   = .idle
         noPathSince      = nil
+        pendingGridUpdates.removeAll()
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.gridTimestamps.removeAll()
             self.update3DGoalMarker(to: nil, cameraY: 0)
-            //self.bleManager.sendHapticValues([0, 0, 0, 0, 0])
-            bleManager.sendCommand("0,0,0,0,0")
+            self.bleManager.sendHapticValues([0, 0, 0, 0, 0])
         }
     }
 }
@@ -813,15 +863,13 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - AR View Bridge
 // ─────────────────────────────────────────────────────────────────────────────
-// Uses the shared arView from LiDARStreamManager so the 3D goal sphere entity
-// lives in the same RealityKit scene as the camera feed.
 
 struct ARViewContainerTwo: UIViewRepresentable {
     @ObservedObject var streamManager: LiDARStreamManager
     @Binding var showCameraFeed: Bool
 
     func makeUIView(context: Context) -> ARView {
-        let v   = streamManager.arView   // ← shared view; 3D goal sphere added here
+        let v   = streamManager.arView
         let cfg = ARWorldTrackingConfiguration()
         if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
             cfg.sceneReconstruction = .meshWithClassification
@@ -876,7 +924,6 @@ struct OccupancyMapView: View {
                     Float(gp.z) * streamManager.gridSize)
             }
 
-            // 1. Occupancy cells
             let cellPx = CGFloat(streamManager.gridSize) * scale * 1.1
             for (pt, cls) in grid {
                 let c = g2c(pt)
@@ -887,7 +934,6 @@ struct OccupancyMapView: View {
                              with: .color(color))
             }
 
-            // 2. Planned path
             if path.count > 1 {
                 var line = Path(); line.move(to: g2c(path[0]))
                 for i in 1..<path.count { line.addLine(to: g2c(path[i])) }
@@ -902,7 +948,6 @@ struct OccupancyMapView: View {
                 }
             }
 
-            // 3. Goal marker
             if let g = goal {
                 let gc = g2c(g)
                 context.fill(Path(ellipseIn:CGRect(x:gc.x-13, y:gc.y-13, width:26, height:26)),
@@ -919,7 +964,6 @@ struct OccupancyMapView: View {
                 }
             }
 
-            // 4. User position + facing arrow
             let userC   = toC(Float(camPos.x), Float(camPos.y))
             let aLen: CGFloat = 22
             let tip = CGPoint(x: userC.x - sin(CGFloat(yaw)) * aLen,
@@ -995,21 +1039,22 @@ struct ARKitVisualView: View {
     @State private var showCameraFeed = true
     @State private var show2DMap = false
 
-    init(bleManager: BLEManager) {
-        self.streamManager  = LiDARStreamManager(ble: bleManager)
-        self.bleManager     = bleManager
-        self.showCameraFeed = true
-        self.show2DMap      = false
+    // FIX (Step 5): streamManager is now injected from HAVENApp (where it lives as
+    // @StateObject) instead of being created here. Previously, creating it inside init()
+    // via ObservedObject(wrappedValue:) meant a new LiDARStreamManager (and ARView) was
+    // allocated on every SwiftUI re-render, causing makeUIView → session.run() to fire
+    // multiple times → "Attempting to enable an already-enabled session. Ignoring...".
+    init(bleManager: BLEManager, streamManager: LiDARStreamManager) {
+        self._streamManager = ObservedObject(wrappedValue: streamManager)
+        self._bleManager    = ObservedObject(wrappedValue: bleManager)
     }
 
     var body: some View {
         ZStack(alignment: .bottom) {
 
-            // Layer 1: AR camera feed (shares arView with manager for 3D goal sphere)
             ARViewContainerTwo(streamManager: streamManager, showCameraFeed: $showCameraFeed)
                 .edgesIgnoringSafeArea(.all)
 
-            // Layer 2: 2D navigation map
             if show2DMap {
                 OccupancyMapView(streamManager: streamManager)
                     .edgesIgnoringSafeArea(.all)
@@ -1017,7 +1062,6 @@ struct ARKitVisualView: View {
                     .zIndex(1)
             }
 
-            // Layer 3: Controls + status
             VStack(spacing: 10) {
                 HapticIndicatorView(values: streamManager.hapticValues)
 
@@ -1068,10 +1112,3 @@ struct ARKitVisualView: View {
         }
     }
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MARK: - Preview
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Note: Preview requires an AppState mock because BLEManager's init needs AppState.
-// Run on device for full functionality.

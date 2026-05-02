@@ -8,7 +8,6 @@
 import SwiftUI
 import CoreBluetooth
 
-
 struct BluetoothView: View {
     @ObservedObject var blemanager: BLEManager
     @State var Showerror = false
@@ -16,14 +15,14 @@ struct BluetoothView: View {
     @State var scanning = false
     @ObservedObject var appState: AppState
     @State var connecting = false
+    
+    // FIXED: Initialize the underlying property wrappers using the underscore prefix.
     init(appState: AppState, ble: BLEManager){
-        self.appState = appState
-        self.blemanager = ble
+        self._appState = ObservedObject(wrappedValue: appState)
+        self._blemanager = ObservedObject(wrappedValue: ble)
     }
+    
     var body: some View {
-        
-        
-        
         if blemanager.FinishedAuto{
             VStack {
                 if !connecting{
@@ -45,11 +44,9 @@ struct BluetoothView: View {
                             Showerror = true
                         }
                         
-                        
                         withAnimation(.default){
                             scanning.toggle()
                         }
-                        
                     }
                     .buttonStyle(.borderedProminent)
                     
@@ -57,9 +54,7 @@ struct BluetoothView: View {
                         appState.currPage = .Algorithm
                     }
                     .buttonStyle(.borderedProminent)
-                }else{
-                    
-                    
+                } else {
                     if !connecting{
                         Button("Stop Scan"){
                             blemanager.stopScanning()
@@ -69,6 +64,7 @@ struct BluetoothView: View {
                             }
                         }
                         .buttonStyle(.borderedProminent)
+                        
                         List(blemanager.peripherals, id: \.identifier){ peripheral in
                             Button(peripheral.name ?? "Unnamed Device"){
                                 blemanager.stopScanning()
@@ -79,15 +75,10 @@ struct BluetoothView: View {
                             }
                         }
                     }
-                    
-                    
-                    
                 }
-                
-                
             }
             .padding()
-            .alert("Bluetooth Error", isPresented: $Showerror,actions: {
+            .alert("Bluetooth Error", isPresented: $Showerror, actions: {
                 Button("Quit"){
                     exit(0)
                 }
@@ -97,6 +88,7 @@ struct BluetoothView: View {
             }, message: {
                 Text("\(ErrorText)")
             })
+            
             if connecting{
                 if !blemanager.connected{
                     ZStack{
@@ -119,7 +111,7 @@ struct BluetoothView: View {
                             Text("Connecting...")
                         }
                     }
-                }else{
+                } else {
                     ZStack{
                         Rectangle()
                             .fill(.gray)
@@ -146,11 +138,6 @@ struct BluetoothView: View {
                     }
                 }
             }
-
-            
-            
-            
-            
         }
         else{
             if !blemanager.connected{
@@ -162,9 +149,8 @@ struct BluetoothView: View {
                     Text("Attempting to Auto Connect...")
                         .font(.system(size: 20, weight: .bold, design: .default))
                         .padding()
-                    
                 }
-            }else{
+            } else {
                 VStack {
                     ProgressView()
                         .progressViewStyle(CircularProgressViewStyle())
@@ -177,19 +163,6 @@ struct BluetoothView: View {
                         .offset(x:-1000)
                 }
             }
-            
-            
-            
-            
-            
         }
-        
     }
 }
-
-
-//#Preview {
-//    var test: AppState = AppState()
-//    var test2: BluetoothState = BluetoothState()
-//    BluetoothView(appState: test)
-//}
