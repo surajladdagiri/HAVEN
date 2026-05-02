@@ -8,8 +8,8 @@
 const unsigned long UPDATE_INTERVAL = 25;
 
 // Maximum intensity sent to any haptic tactor (0–127 RTP scale).
-// Keeping this at or below 50 prevents overdrive on the DRV2605L ERM motors.
-const uint8_t MAX_HAPTIC_INTENSITY = 50;
+// Hard-capped at 25 to prevent overdrive on the DRV2605L ERM motors.
+const uint8_t MAX_HAPTIC_INTENSITY = 25;
 
 const char* SERVICE_UUID        = "54df84fc-7f55-4867-bb29-617f9d2a7925";
 const char* CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
@@ -117,12 +117,13 @@ void updateHaptics() {
         int port = PORTS[i];
         mux.setPort(port);
 
-        drv.begin(&Wire1);
-        drv.useERM();
-        drv.setMode(DRV2605_MODE_REALTIME);
+        // NOTE: drv.begin() / useERM() / setMode() are one-time init calls —
+        // they belong only in setup(). Re-calling them here every 25 ms was
+        // resetting the driver state on each tick, causing latency and jitter.
+        // Only switch the mux port and write the RTP value each update.
 
         // Clamp incoming signal to [0, MAX_HAPTIC_INTENSITY].
-        // This ensures motors never exceed 50 regardless of what iOS sends.
+        // This ensures motors never exceed 25 regardless of what iOS sends.
         uint8_t out = (uint8_t)constrain(signals[i], 0, MAX_HAPTIC_INTENSITY);
 
         drv.setRealtimeValue(out);
