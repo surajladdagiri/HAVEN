@@ -620,7 +620,7 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
             return [0, 0, 0, 0, 0]
         }()
         hapticValues = haptics
-        bleManager.sendHapticValues(haptics.map { UInt8(min(25, max(0, $0))) })
+        bleManager.sendHapticValues(hapticValues)
     }
 
     // ── Special Pattern Engine ────────────────────────────────────────────────
