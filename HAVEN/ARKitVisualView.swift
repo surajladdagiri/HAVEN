@@ -48,7 +48,7 @@ extension GridPoint: Hashable {}
 
 enum NavigationEngine {
 
-    static let gridSize: Float           = 0.05   // 5 cm per cell
+    static let gridSize: Float           = 0.08   // 5 cm per cell
     static let goalDistanceMeters: Float = 3.5    // target horizon
 
     // ── Passability ──────────────────────────────────────────────────────────
