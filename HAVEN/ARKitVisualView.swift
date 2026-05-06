@@ -580,7 +580,7 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
             tickHapticOutput(desiredYaw: storedDesiredYaw, currentYaw: yaw, now: now)
         }
 
-        streamPose(x: wx, y: wy, z: wz)
+        streamPose(x: wx, y: wy, z: wz, yaw: yaw, pitch: frame.camera.eulerAngles.x)
     }
 
     // ── Floor Blindspot Seeding ───────────────────────────────────────────────
@@ -835,16 +835,17 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     // ── TCP Pose Streaming ────────────────────────────────────────────────────
-    private func streamPose(x: Float, y: Float, z: Float) {
+    private func streamPose(x: Float, y: Float, z: Float, yaw: Float, pitch: Float) {
         guard let conn = activeConnection, conn.state == .ready else { return }
         var data = Data()
         data.append("POSE--------------------------------".data(using: .utf8)!)
-        var cnt = Int32(3).littleEndian
+        // 5 floats: x, y, z, yaw, pitch — Python reads all 5 to drive the 3D camera POV.
+        var cnt = Int32(5).littleEndian
         data.append(Data(bytes: &cnt, count: 4))
-        let arr: [Float32] = [x, y, z]
+        let arr: [Float32] = [x, y, z, yaw, pitch]
         arr.withUnsafeBufferPointer { buf in
-            data.append(buf.baseAddress!.withMemoryRebound(to: UInt8.self, capacity: 12) {
-                Data(buffer: UnsafeBufferPointer(start: $0, count: 12))
+            data.append(buf.baseAddress!.withMemoryRebound(to: UInt8.self, capacity: 20) {
+                Data(buffer: UnsafeBufferPointer(start: $0, count: 20))
             })
         }
         conn.send(content: data, completion: .contentProcessed { _ in })
