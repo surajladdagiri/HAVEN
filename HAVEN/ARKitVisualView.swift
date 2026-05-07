@@ -508,6 +508,13 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
                         classID = Float32(cb.advanced(by: off)
                             .assumingMemoryBound(to: UInt8.self).pointee)
                     }
+
+                    var faceFloats: [Float32] = []
+                    faceFloats.reserveCapacity(geo.faces.indexCountPerPrimitive * 4)
+                    var faceUpdates: [(GridPoint, Int)] = []
+                    faceUpdates.reserveCapacity(geo.faces.indexCountPerPrimitive)
+                    var shouldKeepFace = true
+
                     let faceBase = faceIdx * geo.faces.indexCountPerPrimitive * geo.faces.bytesPerIndex
                     for j in 0..<geo.faces.indexCountPerPrimitive {
                         let idxOff  = faceBase + j * geo.faces.bytesPerIndex
@@ -520,15 +527,31 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
                         let w    = simd_mul(anchor.transform, simd_float4(v.x, v.y, v.z, 1.0))
 
                         let vdx = w.x - camX, vdz = w.z - camZ
-                        if vdx*vdx + vdz*vdz > maxVD * maxVD { continue }
+                        if vdx*vdx + vdz*vdz > maxVD * maxVD {
+                            shouldKeepFace = false
+                            break
+                        }
 
-                        anchorFloats += [w.x, w.y, w.z, classID]
+                        faceFloats += [w.x, w.y, w.z, classID]
 
                         let cls = Int(classID)
                         if cls != 3 {
-                            localUpdates[GridPoint(x: Int(round(w.x / gSize)),
-                                                   z: Int(round(w.z / gSize)))] = cls
+                            faceUpdates.append((
+                                GridPoint(x: Int(round(w.x / gSize)),
+                                          z: Int(round(w.z / gSize))),
+                                cls
+                            ))
                         }
+                    }
+
+                    guard shouldKeepFace,
+                          faceFloats.count == geo.faces.indexCountPerPrimitive * 4 else {
+                        continue
+                    }
+
+                    anchorFloats += faceFloats
+                    for (pt, cls) in faceUpdates {
+                        localUpdates[pt] = cls
                     }
                 }
 
