@@ -45,7 +45,9 @@ final class InactivityBlackoutController: ObservableObject {
         blackoutTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: Self.timeoutNanoseconds)
             guard !Task.isCancelled else { return }
-            await self?.showBlackScreen()
+            await MainActor.run {
+                self?.showBlackScreen()
+            }
         }
     }
 

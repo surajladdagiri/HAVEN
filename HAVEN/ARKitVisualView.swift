@@ -14,6 +14,13 @@ import SwiftUI
 import ARKit
 import RealityKit
 import Network
+import Darwin
+
+private enum ViewerStreamPacket {
+    static let port: UInt16 = 8080
+    static let meshHeader = "MESH--------------------------------"
+    static let cameraHeader = "CAMERA------------------------------"
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MARK: - Grid Coordinate
@@ -302,6 +309,7 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
     var listener: NWListener?
     var activeConnection: NWConnection?
     let networkQueue = DispatchQueue(label: "com.haven.network")
+    private var advertisedViewerAddress = "iPhone IP"
 
     // ── Mesh processing queue ─────────────────────────────────────────────────
     // Heavy vertex iteration runs here so the ARKit/main thread is freed promptly.
@@ -377,14 +385,79 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
     // ── TCP Server ────────────────────────────────────────────────────────────
     func startNetworkServer() {
         do {
-            listener = try NWListener(using: .tcp, on: 8080)
+            advertisedViewerAddress = Self.localIPv4Address() ?? "iPhone IP"
+            updateConnectionStatus(connected: false)
+
+            listener = try NWListener(using: .tcp, on: NWEndpoint.Port(rawValue: ViewerStreamPacket.port)!)
             listener?.newConnectionHandler = { [weak self] conn in
-                DispatchQueue.main.async { self?.connectionStatus = "Mac Connected – Streaming" }
-                self?.activeConnection = conn
-                conn.start(queue: self!.networkQueue)
+                guard let self else { return }
+
+                self.activeConnection?.cancel()
+                self.activeConnection = conn
+
+                conn.stateUpdateHandler = { [weak self, weak conn] state in
+                    guard let self else { return }
+                    switch state {
+                    case .ready:
+                        self.updateConnectionStatus(connected: true)
+                    case .cancelled, .failed(_):
+                        if let conn, self.activeConnection === conn {
+                            self.activeConnection = nil
+                            self.updateConnectionStatus(connected: false)
+                        }
+                    default:
+                        break
+                    }
+                }
+
+                conn.start(queue: self.networkQueue)
             }
             listener?.start(queue: networkQueue)
         } catch { print("TCP listener error: \(error)") }
+    }
+
+    private func updateConnectionStatus(connected: Bool) {
+        let status = connected
+            ? "Viewer Connected @ \(advertisedViewerAddress):\(ViewerStreamPacket.port)"
+            : "Waiting for Viewer @ \(advertisedViewerAddress):\(ViewerStreamPacket.port)"
+
+        DispatchQueue.main.async { [weak self] in
+            self?.connectionStatus = status
+        }
+    }
+
+    private static func localIPv4Address() -> String? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddress = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+
+        var cursor: UnsafeMutablePointer<ifaddrs>? = firstAddress
+        while let interface = cursor {
+            defer { cursor = interface.pointee.ifa_next }
+
+            guard let address = interface.pointee.ifa_addr else { continue }
+            guard address.pointee.sa_family == UInt8(AF_INET) else { continue }
+
+            let name = String(cString: interface.pointee.ifa_name)
+            guard name == "en0" else { continue }
+
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = getnameinfo(
+                address,
+                socklen_t(address.pointee.sa_len),
+                &hostname,
+                socklen_t(hostname.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            )
+
+            if result == 0 {
+                return String(cString: hostname)
+            }
+        }
+
+        return nil
     }
 
     // ── ARSession: Mesh Anchors ───────────────────────────────────────────────
@@ -419,6 +492,7 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
                       uuidData.count == 36 else { continue }
 
                 var streamData = Data()
+                streamData.append(ViewerStreamPacket.meshHeader.data(using: .utf8)!)
                 streamData.append(uuidData)
                 var anchorFloats: [Float32] = []
 
@@ -580,7 +654,7 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
             tickHapticOutput(desiredYaw: storedDesiredYaw, currentYaw: yaw, now: now)
         }
 
-        streamPose(x: wx, y: wy, z: wz)
+        streamCameraTransform(tf)
     }
 
     // ── Floor Blindspot Seeding ───────────────────────────────────────────────
@@ -834,19 +908,28 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
         if let g = lockedGoal, occupancyGrid[g] == nil { lockedGoal = nil }
     }
 
-    // ── TCP Pose Streaming ────────────────────────────────────────────────────
-    private func streamPose(x: Float, y: Float, z: Float) {
+    // ── TCP Camera Streaming ──────────────────────────────────────────────────
+    private func streamCameraTransform(_ transform: simd_float4x4) {
         guard let conn = activeConnection, conn.state == .ready else { return }
         var data = Data()
-        data.append("POSE--------------------------------".data(using: .utf8)!)
-        var cnt = Int32(3).littleEndian
+        data.append(ViewerStreamPacket.cameraHeader.data(using: .utf8)!)
+
+        let matrix: [Float32] = [
+            transform.columns.0.x, transform.columns.1.x, transform.columns.2.x, transform.columns.3.x,
+            transform.columns.0.y, transform.columns.1.y, transform.columns.2.y, transform.columns.3.y,
+            transform.columns.0.z, transform.columns.1.z, transform.columns.2.z, transform.columns.3.z,
+            transform.columns.0.w, transform.columns.1.w, transform.columns.2.w, transform.columns.3.w,
+        ]
+
+        var cnt = Int32(matrix.count).littleEndian
         data.append(Data(bytes: &cnt, count: 4))
-        let arr: [Float32] = [x, y, z]
-        arr.withUnsafeBufferPointer { buf in
-            data.append(buf.baseAddress!.withMemoryRebound(to: UInt8.self, capacity: 12) {
-                Data(buffer: UnsafeBufferPointer(start: $0, count: 12))
+
+        matrix.withUnsafeBufferPointer { buf in
+            data.append(buf.baseAddress!.withMemoryRebound(to: UInt8.self, capacity: matrix.count * 4) {
+                Data(buffer: UnsafeBufferPointer(start: $0, count: matrix.count * 4))
             })
         }
+
         conn.send(content: data, completion: .contentProcessed { _ in })
     }
 
@@ -1108,6 +1191,15 @@ struct ARKitVisualView: View {
                         .foregroundColor(bleManager.connected ? .green : .gray)
                         .cornerRadius(10)
                 }
+
+                Text(streamManager.connectionStatus)
+                    .font(.system(.caption2, design: .monospaced))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color.black.opacity(0.65))
+                    .foregroundColor(.white.opacity(0.92))
+                    .cornerRadius(10)
             }
             .padding(.bottom, 44)
             .zIndex(2)
