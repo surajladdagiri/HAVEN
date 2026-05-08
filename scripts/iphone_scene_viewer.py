@@ -40,6 +40,8 @@ COLOR_MAP: dict[int, list[float]] = {
     7: [0.90, 0.50, 0.10],
 }
 
+WORLD_UP = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+
 
 @dataclass
 class MeshPacket:
@@ -227,6 +229,13 @@ def pose_vectors(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray
     up = normalize(rotation[:, 1])
     right = normalize(rotation[:, 0])
     return position, forward, up, right
+
+
+def leveled_heading(forward: np.ndarray) -> np.ndarray:
+    heading = np.array([forward[0], 0.0, forward[2]], dtype=np.float64)
+    if np.linalg.norm(heading) < 1e-6:
+        return np.array([0.0, 0.0, -1.0], dtype=np.float64)
+    return normalize(heading)
 
 
 def draw_2d_map(
@@ -470,16 +479,18 @@ def apply_follow_view(
     if not pose.valid:
         return
 
-    position, forward, up, _ = pose_vectors(pose.matrix)
+    position, forward, _, _ = pose_vectors(pose.matrix)
+    heading = leveled_heading(forward)
+    up = WORLD_UP
     lookat = position + forward * float(args.view_ahead)
     control = vis.get_view_control()
 
     if args.follow_mode == "first_person":
-        front = -forward
+        front = forward
         zoom = float(args.first_person_zoom)
     else:
-        chase_eye = position - forward * float(args.chase_distance) + up * float(args.chase_height)
-        front = normalize(chase_eye - lookat)
+        chase_eye = position - heading * float(args.chase_distance) + up * float(args.chase_height)
+        front = normalize(lookat - chase_eye)
         zoom = float(args.chase_zoom)
 
     control.set_lookat(lookat)

@@ -677,7 +677,7 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
             tickHapticOutput(desiredYaw: storedDesiredYaw, currentYaw: yaw, now: now)
         }
 
-        streamCameraTransform(tf)
+        streamCameraTransform(frame.camera)
     }
 
     // ── Floor Blindspot Seeding ───────────────────────────────────────────────
@@ -932,10 +932,13 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     // ── TCP Camera Streaming ──────────────────────────────────────────────────
-    private func streamCameraTransform(_ transform: simd_float4x4) {
+    private func streamCameraTransform(_ camera: ARCamera) {
         guard let conn = activeConnection, conn.state == .ready else { return }
         var data = Data()
         data.append(ViewerStreamPacket.cameraHeader.data(using: .utf8)!)
+
+        let interfaceOrientation = currentInterfaceOrientationForViewer()
+        let transform = simd_inverse(camera.viewMatrix(for: interfaceOrientation))
 
         let matrix: [Float32] = [
             transform.columns.0.x, transform.columns.1.x, transform.columns.2.x, transform.columns.3.x,
@@ -954,6 +957,13 @@ class LiDARStreamManager: NSObject, ObservableObject, ARSessionDelegate {
         }
 
         conn.send(content: data, completion: .contentProcessed { _ in })
+    }
+
+    private func currentInterfaceOrientationForViewer() -> UIInterfaceOrientation {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        return scenes.lazy
+            .map(\.interfaceOrientation)
+            .first(where: { $0 != .unknown }) ?? .portrait
     }
 
     // ── Cleanup ───────────────────────────────────────────────────────────────
